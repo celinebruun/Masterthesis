@@ -1,0 +1,264 @@
+import xml.etree.ElementTree as ET
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GCNConv, global_mean_pool
+from collections import defaultdict
+import ast
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, f1_score
+from torch.nn.functional import sigmoid
+
+# Group names and mapping 
+group_names = ['Control', 'Disruption', 'Set Piece', 'Out of Play', 'Other']
+group_to_index = {g: i for i, g in enumerate(group_names)}
+
+event_id_to_group = {
+    1: 'Control', 2: 'Control', 7: 'Control', 8: 'Control', 10: 'Control', 11: 'Control',
+    12: 'Control', 13: 'Control', 14: 'Control', 15: 'Control', 16: 'Control', 22: 'Control',
+    23: 'Control', 38: 'Control', 41: 'Control', 53: 'Control', 54: 'Control', 60: 'Control',
+    61: 'Control', 63: 'Control', 74: 'Control', 83: 'Control',
+    4: 'Disruption', 17: 'Disruption', 44: 'Disruption', 45: 'Disruption', 49: 'Disruption',
+    50: 'Disruption', 55: 'Disruption', 56: 'Disruption', 57: 'Disruption',
+    6: 'Set Piece', 58: 'Set Piece',
+    5: 'Out of Play', 27: 'Out of Play', 28: 'Out of Play', 30: 'Out of Play', 32: 'Out of Play',
+    37: 'Out of Play', 64: 'Out of Play', 70: 'Out of Play', 75: 'Out of Play', 76: 'Out of Play',
+    3: 'Other', 18: 'Other', 19: 'Other', 20: 'Other', 21: 'Other', 24: 'Other', 25: 'Other',
+    34: 'Other', 36: 'Other', 39: 'Other', 40: 'Other', 42: 'Other', 43: 'Other', 51: 'Other',
+    52: 'Other', 59: 'Other', 65: 'Other', 67: 'Other', 68: 'Other', 71: 'Other', 79: 'Other',
+    80: 'Other', 81: 'Other', 82: 'Other', 84: 'Other'
+}
+
+def extract_event_data(root):
+    events = []
+    for event in root.findall(".//Event"):
+        try:
+            event_type = int(event.attrib.get("type_id", -1))
+            min_time = int(event.attrib.get("min", 0))
+            sec_time = int(event.attrib.get("sec", 0))
+            timestamp = min_time * 60 + sec_time
+            x = float(event.attrib.get("x", 0.0))
+            y = float(event.attrib.get("y", 0.0))
+            events.append((timestamp, event_type, x, y))
+        except:
+            continue
+    return events
+
+def encode_group_set(group_set):
+    x = np.zeros(len(group_names))
+    for group in group_set:
+        x[group_to_index[group]] = 1
+    return x
+
+def build_labels_stacked(events_data, event_id_to_group, max_time, window_size=5):
+    num_windows = (max_time // window_size) + 1
+    grouped = defaultdict(set)
+    for timestamp, event_id, *_ in events_data:
+        group = event_id_to_group.get(event_id)
+        if group:
+            win_idx = timestamp // window_size
+            grouped[win_idx].add(group)
+    labels = []
+    for i in range(num_windows):
+        group_set = grouped.get(i, set())
+        label = encode_group_set(group_set)
+        labels.append(label)
+    return np.stack(labels)
+
+def parse_tracking_data(xml_path, max_event_time):
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    all_frames = root.findall('.//frame')
+    total_frames = len(all_frames)
+    frames = []
+    for i, frame in enumerate(all_frames):
+        match_time = (i / total_frames) * max_event_time
+        players = frame.findall(".//player")
+        frame_data = {}
+        for player in players:
+            pid = player.attrib.get("id")
+            loc_str = player.attrib.get("loc", "[0.0, 0.0, 0.0]")
+            try:
+                loc = ast.literal_eval(loc_str)
+                x, y = float(loc[0]), float(loc[1])
+                frame_data[pid] = [x, y]
+            except:
+                continue
+        frames.append((match_time, frame_data))
+    return frames
+
+def build_node_features(tracking_data, start_time, end_time):
+    player_positions = defaultdict(list)
+    for timestamp, frame_data in tracking_data:
+        if start_time <= timestamp < end_time:
+            for pid, pos in frame_data.items():
+                player_positions[pid].append(pos)
+    if not player_positions:
+        return np.array([]), []
+    all_ids = sorted(player_positions.keys())
+    features = [np.mean(player_positions[pid], axis=0) for pid in all_ids]
+    return np.array(features), all_ids
+
+def build_edge_index(node_features, threshold=30):
+    edge_index = []
+    for i in range(len(node_features)):
+        for j in range(len(node_features)):
+            if i != j:
+                dist = np.linalg.norm(node_features[i] - node_features[j])
+                if dist < threshold:
+                    edge_index.append([i, j])
+    if not edge_index:
+        return torch.empty((2, 0), dtype=torch.long)
+    return torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+
+def build_graphs_for_match(tracking_data, labels_stacked, window_size=5):
+    graphs = []
+    timestamps = sorted([t for t, _ in tracking_data])
+    start_times = range(0, int(timestamps[-1]), window_size)
+    for i, start in enumerate(start_times):
+        if i >= len(labels_stacked):
+            break
+        end = start + window_size
+        node_features, player_ids = build_node_features(tracking_data, start, end)
+        if len(node_features) == 0:
+            continue
+        edge_index = build_edge_index(node_features)
+        graph = Data(
+            x=torch.tensor(node_features, dtype=torch.float32),
+            edge_index=edge_index,
+            y=torch.tensor(labels_stacked[i], dtype=torch.float32)
+        )
+        graphs.append(graph)
+    return graphs
+
+# Path
+match_files = [
+    ("/Users/celine/Desktop/Speciale/Match data/Match data 1/FC København - FC Nordsjælland-selected/f24-100-2023-2437685-eventdetails.xml",
+     "/Users/celine/Desktop/Speciale/Match data/Match data 1/FC København - FC Nordsjælland-selected/20240526-FCK-FCN_c2e0daa5-c2b2-44d3-a14e-a35650215b79_SecondSpectrum_Data.xml"),
+    ("/Users/celine/Desktop/Speciale/Match data/Match 2/Hvidovre IF - Silkeborg IF-selected/f24-100-2023-2367400-eventdetails.xml",
+     "/Users/celine/Desktop/Speciale/Match data/Match 2/Hvidovre IF - Silkeborg IF-selected/20231020-HVI-SIF_d393345c-695a-4100-8405-02f23f518514_SecondSpectrum_Data.xml")
+]
+
+# Dataset build
+all_graphs = []
+for event_xml, tracking_xml in match_files:
+    tree = ET.parse(event_xml)
+    root = tree.getroot()
+    events_data = extract_event_data(root)
+    if not events_data:
+        continue
+    max_time = max(e[0] for e in events_data)
+    labels_stacked = build_labels_stacked(events_data, event_id_to_group, max_time)
+    tracking_data = parse_tracking_data(tracking_xml, max_time)
+    if not tracking_data:
+        continue
+    graphs = build_graphs_for_match(tracking_data, labels_stacked)
+    all_graphs.extend(graphs)
+
+# Split & loaders
+from torch.utils.data import random_split
+train_size = int(0.8 * len(all_graphs))
+test_size = len(all_graphs) - train_size
+train_set, test_set = random_split(all_graphs, [train_size, test_size])
+train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_set, batch_size=32, shuffle=False)
+
+# Class weights 
+label_counts = np.zeros(len(group_names))
+for g in train_set:
+    label_counts += g.y.numpy()
+class_weights = torch.tensor(len(train_set) / (label_counts + 1e-8), dtype=torch.float32)
+class_weights = torch.clamp(class_weights, max=10.0)
+
+# Model 
+class TGNEventPredictor(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super().__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, hidden_channels)
+        self.lin = nn.Linear(hidden_channels, out_channels)
+
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = self.conv2(x, edge_index)
+        x = F.relu(x)
+        x = global_mean_pool(x, batch)
+        return self.lin(x)
+
+model = TGNEventPredictor(2, 64, len(group_names))
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights)
+
+# Training 
+model.train()
+for epoch in range(10):
+    total_loss = 0
+    for batch in train_loader:
+        optimizer.zero_grad()
+        out = model(batch)
+        target = batch.y.view(-1, len(group_names))
+        loss = criterion(out, target)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    print(f"Epoch {epoch+1:02d} - Loss: {total_loss:.4f}")
+
+# Evaluation with threshold tuning 
+all_probs, all_targets = [], []
+model.eval()
+with torch.no_grad():
+    for batch in test_loader:
+        out = model(batch)
+        probs = sigmoid(out).cpu().numpy()
+        labels = batch.y.view(-1, len(group_names)).cpu().numpy()
+        all_probs.extend(probs)
+        all_targets.extend(labels)
+all_probs = np.array(all_probs)
+all_targets = np.array(all_targets)
+
+# Best thresholds
+best_thresholds = []
+thresholds = np.linspace(0.1, 0.9, 17)
+for class_idx in range(len(group_names)):
+    best_f1 = 0
+    best_thresh = 0.5
+    for thresh in thresholds:
+        preds = (all_probs[:, class_idx] > thresh).astype(int)
+        f1 = f1_score(all_targets[:, class_idx], preds, zero_division=0)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thresh = thresh
+    best_thresholds.append(best_thresh)
+print("Best per-class thresholds:", dict(zip(group_names, best_thresholds)))
+
+# Plot F1 vs Threshold
+plt.figure(figsize=(12, 6))
+for class_idx, class_name in enumerate(group_names):
+    f1_scores = []
+    for thresh in thresholds:
+        preds = (all_probs[:, class_idx] > thresh).astype(int)
+        f1 = f1_score(all_targets[:, class_idx], preds, zero_division=0)
+        f1_scores.append(f1)
+    plt.plot(thresholds, f1_scores, label=f"{class_name} (Best: {best_thresholds[class_idx]:.2f})")
+plt.xlabel("Threshold")
+plt.ylabel("F1 Score")
+plt.title("F1 Score vs Threshold per Class")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Final predictions using best thresholds
+final_preds = np.zeros_like(all_probs)
+for i, t in enumerate(best_thresholds):
+    final_preds[:, i] = (all_probs[:, i] > t).astype(int)
+
+# Final report
+report = classification_report(all_targets, final_preds, target_names=group_names, zero_division=0)
+print("Final Evaluation with Best Thresholds")
+print(report)

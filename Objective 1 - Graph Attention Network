@@ -1,0 +1,112 @@
+import xml.etree.ElementTree as ET
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.data import Data, DataLoader
+from torch_geometric.nn import GATConv, global_mean_pool
+
+# Parse Match Outcome 
+def get_final_score(srml_file, match_uID):
+    tree = ET.parse(srml_file)
+    root = tree.getroot()
+    for match in root.findall("./Match"):
+        if match.get("uID") == match_uID:
+            home_score = int(match.get("home_score", 0))
+            away_score = int(match.get("away_score", 0))
+            return home_score, away_score
+    return None, None
+
+def map_score_to_label(home_score, away_score):
+    if home_score is None or away_score is None:
+        return 1  # default to draw
+    if home_score > away_score:
+        return 2
+    elif home_score == away_score:
+        return 1
+    else:
+        return 0
+
+def build_graph_from_tracking(xml_file, label=0, num_players=30):
+    x = torch.randn(num_players, 3)  
+    edge_index = torch.tensor([[i, j] for i in range(num_players) for j in range(num_players) if i != j],
+                              dtype=torch.long).t().contiguous()
+    return Data(x=x, edge_index=edge_index, y=torch.tensor([label]))
+
+class FootballGAT(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, heads=4):
+        super(FootballGAT, self).__init__()
+        self.gat1 = GATConv(in_channels, hidden_channels, heads=heads, dropout=0.6)
+        self.gat2 = GATConv(hidden_channels * heads, hidden_channels, heads=1, concat=False, dropout=0.6)
+        self.fc = nn.Linear(hidden_channels, out_channels)
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        batch = getattr(data, 'batch', None)
+        x = F.elu(self.gat1(x, edge_index))
+        x = F.elu(self.gat2(x, edge_index))
+        x = global_mean_pool(x, batch) if batch is not None else x.mean(dim=0, keepdim=True)
+        return self.fc(x)
+
+def train_model(model, dataset, epochs=30, batch_size=1, lr=0.001):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0
+        for data in loader:
+            optimizer.zero_grad()
+            out = model(data)
+            loss = criterion(out, data.y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch}, Loss: {total_loss / len(loader):.4f}")
+
+def evaluate_model(model, dataset):
+    model.eval()
+    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data in loader:
+            out = model(data)
+            pred = out.argmax(dim=1)
+            if pred.item() == data.y.item():
+                correct += 1
+            total += 1
+    accuracy = correct / total
+    print(f"Accuracy: {accuracy:.2%}")
+    return accuracy
+
+if __name__ == "__main__":
+    # File paths and match IDs
+    matches = [
+        {
+            "match": "/Users/celine/Desktop/Speciale/Match data/Match data 1/FC København - FC Nordsjælland-selected/srml-100-2023-f2437685-matchresults.xml",
+            "tracking": "/Users/celine/Desktop/Speciale/Match data/Match data 1/FC København - FC Nordsjælland-selected/20240526-FCK-FCN_c2e0daa5-c2b2-44d3-a14e-a35650215b79_SecondSpectrum_Data.xml",
+            "uID": "f2437685"
+        },
+        {
+            "match": "/Users/celine/Desktop/Speciale/Match data/Match 2/Hvidovre IF - Silkeborg IF-selected/srml-100-2023-f2367400-matchresults.xml",
+            "tracking": "/Users/celine/Desktop/Speciale/Match data/Match 2/Hvidovre IF - Silkeborg IF-selected/20231020-HVI-SIF_d393345c-695a-4100-8405-02f23f518514_SecondSpectrum_Data.xml",
+            "uID": "f2367400"
+        }
+    ]
+
+    dataset = []
+    for m in matches:
+        home, away = get_final_score(m["srml"], m["uID"])
+        label = map_score_to_label(home, away)
+        print(f"Match {m['uID']} Outcome: Home {home} - Away {away}, Label: {label}")
+        graph = build_graph_from_tracking(m["tracking"], label=label)
+        dataset.append(graph)
+
+    model = FootballGAT(in_channels=3, hidden_channels=16, out_channels=3)
+    train_model(model, dataset, epochs=30, batch_size=1, lr=0.001)
+    evaluate_model(model, dataset)
+
+    for i, data in enumerate(dataset):
+        output = model(data)
+        prediction = output.argmax(dim=1).item()
+        print(f"Match {i+1} predicted outcome:", {0: "Loss", 1: "Draw", 2: "Win"}[prediction])
